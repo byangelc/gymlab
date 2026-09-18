@@ -24,6 +24,11 @@ describe('what survives a shared plan', () => {
     expect(roundTrip({ warmupSets: 3 }).warmupSets).toBe(3)
   })
 
+  it('carries a non-default Epley deload factor and omits the default', () => {
+    expect(roundTrip({ deloadFactor: 0.8 }).deloadFactor).toBe(0.8)
+    expect('deloadFactor' in roundTrip({ deloadFactor: 0.9 })).toBe(false)
+  })
+
   it('carries progression exclusion on a routine through export and merge', () => {
     const source = stateWith({})
     source.routines[0].excludeFromProgression = true
@@ -39,6 +44,14 @@ describe('what survives a shared plan', () => {
   // rests arrive as the recipient's 60 s default is a different session than the one written.
   it('carries a per-exercise rest', () => {
     expect(roundTrip({ restSec: 180 }).restSec).toBe(180)
+  })
+
+  // The ramp's own rest is the same kind of prescription: a shared plan whose warm-up sets
+  // arrive resting the full working rest is not the plan that was written.
+  it('carries a per-exercise warm-up rest, and leaves it out when unset', () => {
+    expect(roundTrip({ restSec: 150, warmupRestSec: 45 }).warmupRestSec).toBe(45)
+    expect('warmupRestSec' in roundTrip({})).toBe(false)
+    expect('warmupRestSec' in roundTrip({ warmupRestSec: 0 })).toBe(false)
   })
 
   // The absence has to survive too: writing a 0 would pin the recipient's timer to "off"
@@ -84,5 +97,50 @@ describe('what survives a shared plan', () => {
   it('falls back to the default drop percentage when the file omits it', () => {
     const bundle = { opengym_plan: 1, name: 'x', routines: [{ id: 'r', name: 'R', ex: [{ id: '0025', sets: 3, reps: 5, intensifier: { type: 'dropset' } }] }], week: {}, customEx: [] }
     expect(parsePlan(bundle).routines[0].ex[0].intensifier).toEqual({ type: 'dropset', count: 1, pct: 20 })
+  })
+})
+
+// ---- combine routines: a weekday holds a routine-id list (ENG-9 §5) ----
+describe('week schedule as a routine-id list', () => {
+  const twoRoutines = {
+    routines: [
+      { id: 'a', name: 'A', ex: [{ id: '0025', sets: 3, reps: 5 }] },
+      { id: 'b', name: 'B', ex: [{ id: '0031', sets: 3, reps: 8 }] },
+    ],
+    customEx: [],
+  }
+
+  it('build → parse → merge round-trips an array week with arrays intact', () => {
+    const src = { ...twoRoutines, week: { 1: ['a', 'b'], 3: ['a'] } }
+    const parsed = parsePlan(JSON.stringify(buildPlanBundle(src, 'Plan')))
+    expect(parsed.scheduledDays).toBe(2)
+
+    const target = { routines: [], week: {}, customEx: [] }
+    mergePlan(target, parsed, { schedule: true })
+    const [idA, idB] = target.routines.map(r => r.id)
+    expect(target.week[1]).toEqual([idA, idB])
+    expect(target.week[3]).toEqual([idA])
+  })
+
+  it('tolerates a legacy scalar bundle value', () => {
+    const legacy = { opengym_plan: 1, name: 'x', customEx: [], week: { 1: 'a' }, routines: twoRoutines.routines }
+    const parsed = parsePlan(legacy)
+    expect(parsed.scheduledDays).toBe(1)
+    const target = { routines: [], week: {}, customEx: [] }
+    mergePlan(target, parsed, { schedule: true })
+    expect(target.week[1]).toEqual([target.routines[0].id])
+  })
+
+  it('mergePlan drops an element whose id did not survive parsing, never writes undefined', () => {
+    // 'gone' is not among the bundle routines → ridMap has no entry → filtered out
+    const bundle = { routines: [{ id: 'a', name: 'A', ex: [{ id: '0025', sets: 3, reps: 5 }] }], week: { 1: ['a', 'gone'], 2: ['gone'] }, customEx: [] }
+    const target = { routines: [], week: {}, customEx: [] }
+    mergePlan(target, bundle, { schedule: true })
+    expect(target.week[1]).toEqual([target.routines[0].id])
+    expect(target.week[2]).toBeUndefined()             // emptied → left absent, not stored as []
+  })
+
+  it('scheduledDays counts a populated array day as 1 and a [] / absent day as 0', () => {
+    expect(parsePlan({ opengym_plan: 1, routines: [], customEx: [], week: { 1: ['a'], 2: [], 4: 'b' } }).scheduledDays).toBe(2)
   })
 })

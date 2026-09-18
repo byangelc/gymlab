@@ -78,6 +78,7 @@ vi.mock('../sheets.jsx', () => ({
   sessionNoteSheet: vi.fn(),
   effortPickerSheet: mocks.effortPickerSheet,
   exerciseHistorySheet: mocks.exerciseHistorySheet,
+  addRoutineToSessionSheet: vi.fn(),
 }))
 vi.mock('../components/Media.jsx', () => ({ default: () => null }))
 // api.js reads navigator.userAgent at module scope. This file installs its own DOM inside the
@@ -201,6 +202,25 @@ afterEach(async () => {
 })
 
 describe('Workout set completion flow', () => {
+  it('rests the exercise\'s warm-up rest between ramp sets, and its working rest after the last ramp set', async () => {
+    await mount([exercise('ramped-squat', [false, false, false, false], {
+      target: { mode: 'reps', reps: 6, weight: 125, bodyweight: false, restSec: 150, warmupRestSec: 45 },
+      sets: [
+        { w: 60, r: 8, done: false, phase: 'warmup' },
+        { w: 95, r: 5, done: false, phase: 'warmup' },
+        { w: 125, r: 6, done: false, phase: 'work' },
+        { w: 125, r: 6, done: false, phase: 'work' },
+      ],
+    })])
+    await toggleSet(0)
+    expect(mocks.startRest).toHaveBeenLastCalledWith(45, expect.any(Number))
+    await toggleSet(1)
+    expect(mocks.startRest).toHaveBeenLastCalledWith(150, expect.any(Number))
+    await toggleSet(2)
+    expect(mocks.startRest).toHaveBeenLastCalledWith(150, expect.any(Number))
+    expect(mocks.startRest).toHaveBeenCalledTimes(3)
+  })
+
   it('starts rest after a non-final ordinary set, but stops rest without restarting it on the final set', async () => {
     await mount([exercise('plain-bench', [false, false, false])])
     await toggleSet(0)
@@ -1075,6 +1095,116 @@ describe('workout list view', () => {
     // Only the current exercise's sets are on screen.
     expect(container.querySelectorAll('[role="checkbox"]').length).toBe(1)
   })
+
+  it('reads the layout from s.active first, then the global default', async () => {
+    // Global says list, the session was started as cards — the session wins.
+    await mount([exercise('plain-bench', [false])], 0, {
+      workoutView: 'list', active: { workoutView: 'cards' },
+    })
+    expect(container.querySelector('[data-testid="workout-swipe-surface"]')).toBeTruthy()
+    expect(container.querySelector('[data-testid="workout-list"]')).toBeNull()
+  })
+})
+
+describe('workout compact view', () => {
+  const units = () => [...container.querySelectorAll('.wl-unit')]
+  const withExtras = done => exercise('plain-bench', done, {
+    plan: {
+      policy: 'linear', kind: 'up', weight: 62.5,
+      why: ['Every rep last time — {0} {1} more.', 2.5, 'kg'],
+    },
+  })
+
+  it('stacks every exercise like list mode does', async () => {
+    await mount([withExtras([false, false]), exercise('plain-row', [false])], 0, { workoutView: 'compact' })
+
+    expect(container.querySelector('[data-testid="workout-list"]')).toBeTruthy()
+    expect(container.querySelector('[data-testid="workout-swipe-surface"]')).toBeNull()
+    expect(units().length).toBe(2)
+    expect(container.querySelectorAll('[role="checkbox"]').length).toBe(3)
+    // The unit header and its "Set current" chip are part of list mode, kept in compact.
+    expect(units()[0].textContent).toContain('Current')
+  })
+
+  it('strips the progression line, tags and last-time recap that list mode shows', async () => {
+    const state = {
+      workoutView: 'compact',
+      exWeights: { 'plain-bench': { w: 80 } },
+      workouts: [{ d: '2026-08-27', entries: [{ id: 'plain-bench', target: { reps: 5, weight: 60 }, sets: [{ w: 60, r: 5, done: true }] }] }],
+    }
+    await mount([withExtras([false])], 0, state)
+
+    expect(container.querySelector('.progline')).toBeNull()
+    expect(container.textContent).not.toContain('Best:')
+    expect(container.textContent).not.toContain('Last time')
+    // The sets card and the ⋯ menu button survive — nothing is truly unreachable.
+    expect(container.querySelector('.setrow')).toBeTruthy()
+    expect(container.querySelector('button[aria-label="More"]')).toBeTruthy()
+  })
+
+  it('keeps those same elements in list mode (the strip is compact-only)', async () => {
+    const state = {
+      workoutView: 'list',
+      exWeights: { 'plain-bench': { w: 80 } },
+      workouts: [{ d: '2026-08-27', entries: [{ id: 'plain-bench', target: { reps: 5, weight: 60 }, sets: [{ w: 60, r: 5, done: true }] }] }],
+    }
+    await mount([withExtras([false])], 0, state)
+
+    expect(container.querySelector('.progline')).toBeTruthy()
+    expect(container.textContent).toContain('Best:')
+    expect(container.textContent).toContain('Last time')
+  })
+
+  it('completing a set still starts the rest, like list and cards', async () => {
+    await mount([
+      exercise('plain-bench', [false], { asked: true }),
+      exercise('plain-row', [false], { asked: true }),
+    ], 0, { workoutView: 'compact' })
+
+    await toggleSet(0)
+
+    expect(mocks.S.active.entries[0].sets[0].done).toBe(true)
+    expect(mocks.startRest).toHaveBeenCalledWith(90, expect.any(Number))
+  })
+})
+
+describe('workout view header menu', () => {
+  const openMenu = async () => {
+    const btn = container.querySelector('button[aria-label="Workout view"]')
+    expect(btn).toBeTruthy()
+    await act(async () => { btn.dispatchEvent(new dom.Event('click', { bubbles: true })) })
+    return mocks.menuSheet.mock.calls.at(-1)[0]
+  }
+  const item = (menu, label) => menu.items.filter(Boolean).find(it => it.label === label)
+
+  // The header ⋮ now leads with "Add routine"; the layouts moved to a nested "Layout" sheet.
+  const openLayout = async menu => {
+    await act(async () => { item(menu, 'Layout').onClick() })
+    return mocks.menuSheet.mock.calls.at(-1)[0]
+  }
+
+  it('leads with Add routine, then a Layout sheet with the three layouts marked current', async () => {
+    await mount([exercise('plain-bench', [false])], 0, { active: { workoutView: 'list', routineIds: [] } })
+
+    const menu = await openMenu()
+    expect(menu.items.filter(Boolean).map(it => it.label)).toEqual(['Add routine', 'Layout'])
+    expect(item(menu, 'Layout').sub).toBe('List')
+
+    const layout = await openLayout(menu)
+    expect(layout.items.filter(Boolean).map(it => it.label)).toEqual(['Cards', 'List', 'Compact'])
+    expect(item(layout, 'List').on).toBe(true)
+    expect(item(layout, 'Cards').on).toBe(false)
+  })
+
+  it('writes the layout pick onto s.active without touching the global default', async () => {
+    await mount([exercise('plain-bench', [false])], 0, { workoutView: 'cards', active: { workoutView: 'cards', routineIds: [] } })
+
+    const layout = await openLayout(await openMenu())
+    await act(async () => { item(layout, 'Compact').onClick() })
+
+    expect(mocks.S.active.workoutView).toBe('compact')
+    expect(mocks.S.workoutView).toBe('cards')
+  })
 })
 
 describe('workout controls: the more menu and the set menu', () => {
@@ -1146,5 +1276,89 @@ describe('workout controls: the more menu and the set menu', () => {
     await mount([exercise('plain-bench', [false])], 0, { wc: { steppers: false } })
     expect(container.querySelector('.setrow .stp button[aria-label="Increase"]')).toBeNull()
     expect(container.querySelector('.setrow .stp.plain .num')).toBeTruthy()
+  })
+})
+
+// Rating a set's effort concludes it (issue #64): picking an RIR/RPE value ticks the set and
+// starts the rest timer, so you don't confirm a finished set twice.
+describe('effort rating auto-ends the set', () => {
+  // Open the effort picker for set `index` and return the onPick callback the cell handed it.
+  async function openEffortPicker(index = 0) {
+    const cell = container.querySelectorAll('.setrow .effcell.is-empty, .setrow .effcell-stp .val')[index]
+    expect(cell).toBeTruthy()
+    await act(async () => { cell.dispatchEvent(new dom.Event('click', { bubbles: true })) })
+    const call = mocks.effortPickerSheet.mock.calls.at(-1)
+    expect(call?.[2]).toEqual(expect.any(Function))
+    return call[2]
+  }
+
+  it('ticks the set and starts the rest timer when a rating is picked', async () => {
+    await mount([exercise('plain-bench', [false, false])], 0, { effort: 'rir' })
+    const onPick = await openEffortPicker(0)
+
+    await act(async () => { onPick(2) })
+
+    expect(mocks.S.active.entries[0].sets[0].rir).toBe(2)
+    expect(mocks.S.active.entries[0].sets[0].done).toBe(true)
+    expect(mocks.startRest).toHaveBeenCalledWith(90, expect.any(Number))
+  })
+
+  it('does not re-toggle a set that is already done — a rating change leaves it done', async () => {
+    await mount([exercise('plain-bench', [true, false])], 0, { effort: 'rir' })
+    const onPick = await openEffortPicker(0)
+
+    await act(async () => { onPick(1) })
+
+    expect(mocks.S.active.entries[0].sets[0].rir).toBe(1)
+    expect(mocks.S.active.entries[0].sets[0].done).toBe(true)   // stays done, not toggled off
+    // No rest timer for a re-rate of already-finished work (would have been the "recheck" path).
+    expect(mocks.startRest).not.toHaveBeenCalled()
+  })
+
+  it('clearing a rating never un-ticks the set — ending a set stays a manual undo', async () => {
+    await mount([exercise('plain-bench', [false]), exercise('next', [false])], 0, { effort: 'rir' })
+    const onPick = await openEffortPicker(0)
+
+    await act(async () => { onPick(3) })          // rate → done
+    expect(mocks.S.active.entries[0].sets[0].done).toBe(true)
+
+    await act(async () => { onPick(null) })        // clear the number
+    expect(mocks.S.active.entries[0].sets[0].rir).toBeUndefined()
+    expect(mocks.S.active.entries[0].sets[0].done).toBe(true)   // still done
+  })
+})
+
+describe('per-side effort completion', () => {
+  it.each(['rir', 'rpe'])('completes only the rated side for %s and keeps undo explicit', async scale => {
+    const side = () => ({ w: 20, r: 8, done: false })
+    await mount([exercise('plain-bench', [false], {
+      target: { mode: 'reps', side: true, reps: 16, weight: 20, bodyweight: false },
+      sets: [
+        { w: 20, r: 16, done: false, sides: { L: side(), R: side() } },
+        { w: 20, r: 16, done: false, sides: { L: side(), R: side() } },
+      ],
+    })], 0, { effort: scale })
+    const cells = container.querySelectorAll('.side-rows .effcell.is-empty')
+    await act(async () => { cells[0].dispatchEvent(new dom.Event('click', { bubbles: true })) })
+    const leftPick = mocks.effortPickerSheet.mock.calls.at(-1)[2]
+    await act(async () => { leftPick(scale === 'rir' ? 2 : 8) })
+    let set = mocks.S.active.entries[0].sets[0]
+    expect(set.sides.L.done).toBe(true)
+    expect(set.sides.R.done).toBe(false)
+    expect(set.done).toBe(false)
+    expect(mocks.startRest).not.toHaveBeenCalled()
+    await act(async () => { leftPick(3); leftPick(null) })
+    expect(mocks.S.active.entries[0].sets[0].sides.L.done).toBe(true)
+    expect(mocks.S.active.entries[0].sets[0].sides.L[scale]).toBeUndefined()
+    await act(async () => { cells[1].dispatchEvent(new dom.Event('click', { bubbles: true })) })
+    const rightPick = mocks.effortPickerSheet.mock.calls.at(-1)[2]
+    await act(async () => { rightPick(scale === 'rir' ? 0 : 10) })
+    set = mocks.S.active.entries[0].sets[0]
+    expect(set.done).toBe(true)
+    expect(mocks.startRest).toHaveBeenCalledWith(90, expect.any(Number))
+    const calls = mocks.startRest.mock.calls.length
+    await act(async () => { rightPick(1) })
+    expect(set.sides.R.done).toBe(true)
+    expect(mocks.startRest).toHaveBeenCalledTimes(calls)
   })
 })

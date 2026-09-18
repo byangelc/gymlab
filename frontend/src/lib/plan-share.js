@@ -10,6 +10,7 @@
 
 import { EXIDX, isBodyweightEq } from './exercises.js'
 import { modeOf, fmtSec, isBw, isPerSide, sideReps, MAX_PLANNED_WARMUPS } from './history.js'
+import { deriveSessionName } from './session-merge.js'
 import { uid, todayISO, DAYN, weekOrder, weekStartOf, fmtNum, exCount } from './format.js'
 import { t, exerciseNameFor } from './i18n-core.js'
 
@@ -43,12 +44,16 @@ function cleanEx(e) {
   // without its rule is just a list of weights.
   if (e.prog) o.prog = e.prog
   if (e.inc > 0) o.inc = e.inc
+  // Epley deload factor is a per-occurrence progression setting. Omit the default so older
+  // exports remain compact and importing them preserves the default 90% behaviour.
+  if (e.deloadFactor != null && Number(e.deloadFactor) !== 0.9) o.deloadFactor = e.deloadFactor
   if (e.repsMin != null) o.repsMin = e.repsMin
   if (e.repsMax != null) o.repsMax = e.repsMax
   // The exercise's own rest (issue #10) is part of how it is prescribed, so it travels too —
   // only when set, so a plan that never asked for one leaves the recipient's own default
   // timer in charge. parsePlan and mergePlan carry it through by spread.
   if (e.restSec > 0) o.restSec = e.restSec
+  if (e.warmupRestSec > 0) o.warmupRestSec = e.warmupRestSec   // the ramp's own rest travels with the work rest
   if (e.sg) o.sg = e.sg
   if (e.note) o.note = e.note
   const warm = cleanWarmupSets(e.warmupSets)
@@ -100,8 +105,11 @@ export function buildPlanBundle(S, name) {
   const customEx = (S.customEx || [])
     .filter(c => usedIds.has(c.id))
     .map(c => ({ id: c.id, n: c.n, bp: c.bp, ...(c.desc ? { desc: c.desc } : {}) }))
+  // A weekday can hold several routines (merge order preserved). `[].concat` normalises a
+  // legacy scalar id to a one-element list, so a bundle written before this change and one
+  // written after are read the same way at the other end.
   const week = {}
-  WEEK_DAYS.forEach(d => { if (S.week?.[d]) week[d] = S.week[d] })
+  WEEK_DAYS.forEach(d => { if (S.week?.[d]?.length) week[d] = [].concat(S.week[d]) })
   return { opengym_plan: PLAN_FMT, exported: todayISO(), name: name || '', week, routines, customEx }
 }
 
@@ -134,8 +142,9 @@ export function parsePlan(raw) {
       const warm = cleanWarmupSets(e.warmupSets)
       const intens = cleanIntensifier(e.intensifier)
       const rest = cleanRestSec(e.restSec)
-      const { warmupSets, intensifier, restSec, ...passthrough } = e
-      return { ...passthrough, ...(warm ? { warmupSets: warm } : {}), ...(intens ? { intensifier: intens } : {}), ...(rest ? { restSec: rest } : {}) }
+      const warmRest = cleanRestSec(e.warmupRestSec)
+      const { warmupSets, intensifier, restSec, warmupRestSec, ...passthrough } = e
+      return { ...passthrough, ...(warm ? { warmupSets: warm } : {}), ...(intens ? { intensifier: intens } : {}), ...(rest ? { restSec: rest } : {}), ...(warmRest ? { warmupRestSec: warmRest } : {}) }
     })
   }))
   return {
@@ -146,7 +155,7 @@ export function parsePlan(raw) {
     dropped,
     routineCount: routines.length,
     exerciseCount: routines.reduce((n, r) => n + r.ex.length, 0),
-    scheduledDays: WEEK_DAYS.filter(d => data.week?.[d]).length
+    scheduledDays: WEEK_DAYS.filter(d => data.week?.[d]?.length).length
   }
 }
 
@@ -182,8 +191,12 @@ export function mergePlan(s, bundle, { schedule } = {}) {
   })
   if (schedule) {
     WEEK_DAYS.forEach(d => { delete s.week[d] })
-    Object.entries(bundle.week || {}).forEach(([d, oldId]) => {
-      if (ridMap[oldId]) s.week[d] = ridMap[oldId]
+    Object.entries(bundle.week || {}).forEach(([d, val]) => {
+      // `[].concat` tolerates a pre-upgrade scalar bundle value. An element whose routine id
+      // didn't survive parsing is dropped, not written as undefined; a day that ends up empty
+      // is left absent rather than stored as `[]`.
+      const ids = [].concat(val).map(oldId => ridMap[oldId]).filter(Boolean)
+      if (ids.length) s.week[d] = ids
     })
   }
   return { routines: bundle.routines.length }
@@ -243,8 +256,10 @@ function routineHTML(r, unit) {
 function weekHTML(S) {
   // The printout is read by whoever exported it, so the week runs in their order.
   const rows = weekOrder(weekStartOf(S)).map(d => {
-    const r = S.routines.find(x => x.id === S.week?.[d])
-    const val = r ? esc(r.name) : `<span class="rest">${esc(t('Rest'))}</span>`
+    const names = [].concat(S.week?.[d] || [])
+      .map(id => S.routines.find(x => x.id === id)?.name)
+      .filter(Boolean)
+    const val = names.length ? esc(deriveSessionName(names)) : `<span class="rest">${esc(t('Rest'))}</span>`
     return `<div class="w-row"><div class="w-day">${esc(t(DAYN[d]))}</div><div class="w-r">${val}</div></div>`
   }).join('')
   return `<div class="week">${rows}</div>`
