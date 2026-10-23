@@ -83,63 +83,126 @@ TARGET="$(git rev-parse origin/main)"
 git log -1 --oneline origin/main
 echo
 
-echo "5. Comprobando si hay una nueva versión..."
+echo "5. Comprobando cambios de código e imágenes..."
 
-if [[ "$CURRENT" == "$TARGET" ]]; then
-  echo "✓ Producción ya está actualizada."
-  echo "✓ No se modificó producción."
+CODE_CHANGED=false
+if [[ "$CURRENT" != "$TARGET" ]]; then
+  CODE_CHANGED=true
+  echo "Nueva versión de código detectada:"
+  echo "  Actual: $CURRENT"
+  echo "  Nueva:  $TARGET"
+  git log --oneline "$CURRENT..$TARGET"
+else
+  echo "✓ El código ya coincide con origin/main."
+fi
+echo
+
+echo "6. Registrando las imágenes que están en ejecución..."
+API_CONTAINER_ID="$($COMPOSE ps -q api 2>/dev/null || true)"
+WEB_CONTAINER_ID="$($COMPOSE ps -q web 2>/dev/null || true)"
+RUNNING_API_IMAGE_ID=""
+RUNNING_WEB_IMAGE_ID=""
+
+if [[ -n "$API_CONTAINER_ID" ]]; then
+  RUNNING_API_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$API_CONTAINER_ID")"
+fi
+if [[ -n "$WEB_CONTAINER_ID" ]]; then
+  RUNNING_WEB_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$WEB_CONTAINER_ID")"
+fi
+echo
+
+if [[ "$CODE_CHANGED" == true ]]; then
+  DEPLOY_STARTED=true
+
+  echo "7. Ejecutando backup antes de actualizar el código..."
+  ./scripts/backup-production.sh | tee "$TMP_BACKUP_OUTPUT"
+  BACKUP_FILE="$(awk -F': ' '/  Archivo:/ {print $2}' "$TMP_BACKUP_OUTPUT" | tail -1)"
+  [[ -n "$BACKUP_FILE" ]] || BACKUP_FILE="unknown"
   echo
-  echo "=== FIN ==="
-  exit 0
+
+  echo "8. Actualizando código..."
+  git pull --ff-only origin main
+  echo
+else
+  echo "7. No hay cambios de código que integrar."
 fi
 
-DEPLOY_STARTED=true
-
-echo "Nueva versión detectada:"
-echo "  Actual:   $CURRENT"
-echo "  Nueva:    $TARGET"
-echo
-
-echo "Cambios que se desplegarán:"
-git log --oneline "$CURRENT..$TARGET"
-echo
-
-echo "6. Ejecutando backup antes del despliegue..."
-./scripts/backup-production.sh | tee "$TMP_BACKUP_OUTPUT"
-
-BACKUP_FILE="$(awk -F': ' '/  Archivo:/ {print $2}' "$TMP_BACKUP_OUTPUT" | tail -1)"
-
-if [[ -z "$BACKUP_FILE" ]]; then
-  BACKUP_FILE="unknown"
-fi
-
-echo
-echo "7. Actualizando código..."
-git pull --ff-only origin main
-echo
-
-echo "8. Validando Docker Compose..."
+echo "9. Validando Docker Compose..."
 $COMPOSE config >/dev/null
 echo "✓ Compose válido"
 echo
 
-echo "9. Descargando imágenes..."
+API_IMAGE="$($COMPOSE config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["api"]["image"])')"
+WEB_IMAGE="$($COMPOSE config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["web"]["image"])')"
+
+echo "10. Comprobando imágenes disponibles en el registro..."
+echo "API: $API_IMAGE"
+echo "Web: $WEB_IMAGE"
 $COMPOSE pull
 echo
 
-echo "10. Recreando servicios..."
+PULLED_API_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$API_IMAGE")"
+PULLED_WEB_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$WEB_IMAGE")"
+
+IMAGE_CHANGED=false
+if [[ -z "$RUNNING_API_IMAGE_ID" || "$RUNNING_API_IMAGE_ID" != "$PULLED_API_IMAGE_ID" ]]; then
+  IMAGE_CHANGED=true
+  echo "• La imagen de la API es nueva o cambió."
+fi
+if [[ -z "$RUNNING_WEB_IMAGE_ID" || "$RUNNING_WEB_IMAGE_ID" != "$PULLED_WEB_IMAGE_ID" ]]; then
+  IMAGE_CHANGED=true
+  echo "• La imagen web es nueva o cambió."
+fi
+
+if [[ "$CODE_CHANGED" == false && "$IMAGE_CHANGED" == false ]]; then
+  echo "✓ No hay cambios de código ni de imágenes."
+  log_deploy "NO-CHANGE" "$TARGET"
+  echo
+  echo "=== FIN: no fue necesario recrear los servicios ==="
+  exit 0
+fi
+
+if [[ "$CODE_CHANGED" == false ]]; then
+  DEPLOY_STARTED=true
+  echo
+  echo "11. Ejecutando backup antes de recrear los servicios..."
+  ./scripts/backup-production.sh | tee "$TMP_BACKUP_OUTPUT"
+  BACKUP_FILE="$(awk -F': ' '/  Archivo:/ {print $2}' "$TMP_BACKUP_OUTPUT" | tail -1)"
+  [[ -n "$BACKUP_FILE" ]] || BACKUP_FILE="unknown"
+  echo
+fi
+
+echo "12. Recreando servicios..."
 $COMPOSE up -d --force-recreate
 echo
 
-echo "11. Esperando servicios..."
-sleep 10
+echo "13. Esperando a que API y web estén saludables (máximo 16 minutos)..."
 
-echo "12. Comprobando estado..."
+API_STATUS=""
+WEB_STATUS=""
+
+for ((attempt=1; attempt<=192; attempt++)); do
+  API_STATUS="$($COMPOSE ps --format '{{.Service}} {{.Health}}' | awk '$1 == "api" {print $2}')"
+  WEB_STATUS="$($COMPOSE ps --format '{{.Service}} {{.Health}}' | awk '$1 == "web" {print $2}')"
+
+  if [[ "$API_STATUS" == "healthy" && "$WEB_STATUS" == "healthy" ]]; then
+    break
+  fi
+
+  if [[ "$API_STATUS" == "unhealthy" || "$WEB_STATUS" == "unhealthy" ]]; then
+    break
+  fi
+
+  if (( attempt % 6 == 0 )); then
+    echo "Esperando: API=${API_STATUS:-desconocido}, Web=${WEB_STATUS:-desconocido}"
+  fi
+  sleep 5
+done
+
+echo
+echo "14. Comprobando estado final..."
 $COMPOSE ps
 echo
-
-API_STATUS="$($COMPOSE ps --format '{{.Service}} {{.Health}}' | awk '$1 == "api" {print $2}')"
-WEB_STATUS="$($COMPOSE ps --format '{{.Service}} {{.Health}}' | awk '$1 == "web" {print $2}')"
 
 if [[ "$API_STATUS" != "healthy" ]]; then
   echo "ERROR: API no está healthy."
